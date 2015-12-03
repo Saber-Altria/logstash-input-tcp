@@ -1,6 +1,7 @@
 # encoding: utf-8
 require "logstash/inputs/base"
 require "logstash/util/socket_peer"
+require "logstash/plugin_mixins/jdbc"
 
 require "socket"
 require "openssl"
@@ -11,7 +12,8 @@ require "openssl"
 #
 # Can either accept connections from clients or connect to a server,
 # depending on `mode`.
-class LogStash::Inputs::Tcp < LogStash::Inputs::Base
+class LogStash::Inputs::Tcp < LogStash::Inputs::Base 
+  include LogStash::PluginMixins::Jdbc
   config_name "tcp"
 
   default :codec, "line"
@@ -24,6 +26,8 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
   # When mode is `client`, the port to connect to.
   config :port, :validate => :number, :required => true
 
+  config :user_limit, :validate => :string, :default => "500M"
+
   config :data_timeout, :validate => :number, :default => -1, :deprecated => "This setting is not used by this plugin. It will be removed soon."
 
   # Mode to operate in. `server` listens for client connections,
@@ -35,10 +39,10 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
   # Verify the identity of the other end of the SSL connection against the CA.
   # For input, sets the field `sslsubject` to that of the client certificate.
-  config :ssl_verify, :validate => :boolean, :default => true
+  config :ssl_verify, :validate => :boolean, :default => false
 
   # The SSL CA certificate, chainfile or CA path. The system CA path is automatically included.
-  config :ssl_cacert, :validate => :path, :deprecated => "This setting is deprecated in favor of ssl_extra_chain_certs as it sets a more clear expectation to add more X509 certificates to the store"
+  config :ssl_cacert, :validate => :path
 
   # SSL certificate path
   config :ssl_cert, :validate => :path
@@ -48,10 +52,6 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
   # SSL key passphrase
   config :ssl_key_passphrase, :validate => :password, :default => nil
-
-  # An Array of extra X509 certificates to be added to the certificate chain.
-  # Useful when the CA chain is not necessary in the system store.
-  config :ssl_extra_chain_certs, :validate => :array, :default => []
 
   def initialize(*args)
     super(*args)
@@ -71,6 +71,7 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
   def register
     fix_streaming_codecs
+    prepare_jdbc_connection
 
     # note that since we are opening a socket in register, we must also make sure we close it
     # in the close method even if we also close it in the stop method since we could have
@@ -130,7 +131,7 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
   def run_client(output_queue)
     while !stop?
       self.client_socket = new_client_socket
-      handle_socket(client_socket, client_socket.peeraddr[3], client_socket.peeraddr[1], output_queue, @codec.clone)
+      handle_socket(client_socket, client_socket.peeraddr[3], output_queue, @codec.clone)
     end
   ensure
     # catch all rescue nil on close to discard any close errors or invalid socket
@@ -141,31 +142,50 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
     Thread.new(output_queue, socket) do |q, s|
       begin
         @logger.debug? && @logger.debug("Accepted connection", :client => s.peer, :server => "#{@host}:#{@port}")
-        handle_socket(s, s.peeraddr[3], s.peeraddr[1], q, @codec.clone)
+        handle_socket(s, s.peeraddr[3], q, @codec.clone)
       ensure
         delete_connection_socket(s)
       end
     end
   end
 
-  def handle_socket(socket, client_address, client_port, output_queue, codec)
+  def parse_limit(limit)
+    if limit.end_with?("M") or limit.end_with("m") 
+        limit.gsub(/[mM]/,'').to_i*1024*1024
+	else limit.end_with?("G") or limit.end_with("g") 
+        limit.gsub(/[gG]/,'').to_i*1024*1024*1024
+    end
+  end
+
+  def handle_socket(socket, client_address, output_queue, codec)
     while !stop?
       codec.decode(read(socket)) do |event|
-        event["host"] ||= client_address
-        event["port"] ||= client_port
-        event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
-        decorate(event)
-        output_queue << event
+   		 splits = event["message"].to_s.split(" ")
+   		 parameters = {}
+   		 parameters['uuid']=splits[0]
+   		 execute_statement("select used from user where uuid= :uuid",parameters) do |row|
+   		     num = row['used'] + event["message"].to_s.length
+   		     parameters={}
+   		     dataset = @database[:user].where(:uuid => splits[0])
+   		     if dataset.first[:used].to_i<parse_limit(@user_limit)
+   		         dataset.update(:used => num)
+   		         event["host"] ||= client_address
+   		         event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
+   		         decorate(event)
+   		         output_queue << event
+			else
+				socket.puts "you reach your limit :"+ parse_limit(@user_limit).to_s
+				socket.close
+	        end
+   		 end
       end
     end
   rescue EOFError
     @logger.debug? && @logger.debug("Connection closed", :client => socket.peer)
   rescue Errno::ECONNRESET
     @logger.debug? && @logger.debug("Connection reset by peer", :client => socket.peer)
-  rescue OpenSSL::SSL::SSLError => e
-    # Fixes issue #23
-    @logger.error("SSL Error", :exception => e, :backtrace => e.backtrace)
-    socket.close rescue nil
+  rescue IOError
+	@logger.debug? && @logger.debug("Connection reset by server",:client => socket.peer)
   rescue => e
     # if plugin is stopping, don't bother logging it as an error
     !stop? && @logger.error("An error occurred. Closing connection", :client => socket.peer, :exception => e, :backtrace => e.backtrace)
@@ -175,28 +195,12 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
     codec.respond_to?(:flush) && codec.flush do |event|
       event["host"] ||= client_address
-      event["port"] ||= client_port
       event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
       decorate(event)
       output_queue << event
     end
   end
 
-  private
-  def client_thread(output_queue, socket)
-    Thread.new(output_queue, socket) do |q, s|
-      begin
-        @logger.debug? && @logger.debug("Accepted connection", :client => s.peer, :server => "#{@host}:#{@port}")
-        handle_socket(s, s.peeraddr[3], s.peeraddr[1], q, @codec.clone)
-      rescue Interrupted
-        s.close rescue nil
-      ensure
-        @client_threads_lock.synchronize{@client_threads.delete(Thread.current)}
-      end
-    end
-  end
-
-  private
   def server?
     @mode == "server"
   end
@@ -213,7 +217,15 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
       @ssl_context.cert = OpenSSL::X509::Certificate.new(File.read(@ssl_cert))
       @ssl_context.key = OpenSSL::PKey::RSA.new(File.read(@ssl_key),@ssl_key_passphrase)
       if @ssl_verify
-        @ssl_context.cert_store  = load_cert_store
+        @cert_store = OpenSSL::X509::Store.new
+        # Load the system default certificate path to the store
+        @cert_store.set_default_paths
+        if File.directory?(@ssl_cacert)
+          @cert_store.add_path(@ssl_cacert)
+        else
+          @cert_store.add_file(@ssl_cacert)
+        end
+        @ssl_context.cert_store = @cert_store
         @ssl_context.verify_mode = OpenSSL::SSL::VERIFY_PEER|OpenSSL::SSL::VERIFY_FAIL_IF_NO_PEER_CERT
       end
     rescue => e
@@ -224,22 +236,9 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
     @ssl_context
   end
 
-  def load_cert_store
-    cert_store = OpenSSL::X509::Store.new
-    cert_store.set_default_paths
-    if File.directory?(@ssl_cacert)
-      cert_store.add_path(@ssl_cacert)
-    else
-      cert_store.add_file(@ssl_cacert)
-    end if @ssl_cacert
-    @ssl_extra_chain_certs.each do |cert|
-      cert_store.add_file(cert)
-    end
-    cert_store
-  end
-
   def new_server_socket
     @logger.info("Starting tcp input listener", :address => "#{@host}:#{@port}")
+
     begin
       socket = TCPServer.new(@host, @port)
     rescue Errno::EADDRINUSE
