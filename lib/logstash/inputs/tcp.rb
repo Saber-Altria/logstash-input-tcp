@@ -152,8 +152,10 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
   def parse_limit(limit)
     if limit.end_with?("M") or limit.end_with("m") 
         limit.gsub(/[mM]/,'').to_i*1024*1024
-	else limit.end_with?("G") or limit.end_with("g") 
+	elsif limit.end_with?("G") or limit.end_with("g") 
         limit.gsub(/[gG]/,'').to_i*1024*1024*1024
+	else
+		500*1024*1024
     end
   end
 
