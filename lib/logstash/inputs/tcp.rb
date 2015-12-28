@@ -168,7 +168,6 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
    		     parameters={}
    		     dataset = @database[:user].where(:uuid => splits[0])
    		     if dataset.first[:used].to_i<parse_limit(@user_limit)
-   		 		puts parse_limit(@user_limit)
    		         dataset.update(:used => num)
    		         event["host"] ||= client_address
    		         event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
