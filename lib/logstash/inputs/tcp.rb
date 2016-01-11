@@ -151,37 +151,37 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
   def parse_limit(limit)
     if limit.end_with?("M") or limit.end_with("m") 
-        limit.gsub(/[mM]/,'').to_i<<20
+            limit.gsub(/[mM]/,'').to_i<<20
 	elsif limit.end_with?("G") or limit.end_with("g") 
-        limit.gsub(/[gG]/,'').to_i<<30
+            limit.gsub(/[gG]/,'').to_i<<30
 	else
-		500<<20
+	    500<<20
     end
   end
 
   def handle_socket(socket, client_address, output_queue, codec)
     while !stop?
       codec.decode(read(socket)) do |event|
-   		 splits = event["message"].to_s.split(" ")
-   		 token = splits[0]
-   		 @database[:user].where(:uuid => token) do |row|
-			 uh = @database[:user_history].where(:uuid => token).where(:create_date => Time.new.strftime("%F"))
-   		     event_length = event["message"].to_s.length
-   		     if uh[:used].to_i<parse_limit(@user_limit)
-   		         if 1 != uh.update(:used => uh[:used].to_i + event_length)
-					@database[:user_history].insert(:uuid => token , :create_date => Time.new.strftime("%F") ,:used => event_length, :search_times => 0 ,:search_time_consume => 0,:aggregate_times =>0,:aggregate_time_consume => 0)
-				 end
-				 event["host"] ||= client_address
-   		         event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
-   		         decorate(event)
-   		         output_queue << event
-			else
-				socket.puts "you reach your limit :"+ parse_limit(@user_limit).to_s
-				socket.close
-	        end
-   		 end
-      end
-    end
+   	splits = event["message"].to_s.split(" ")
+   	token = splits[0]
+	@database[:user].where(:uuid => token) do |row|
+	    uh = @database[:user_history].where(:uuid => token).where(:create_date => Time.new.strftime("%F"))
+   	    event_length = event["message"].to_s.length
+   	    if uh[:used].to_i<parse_limit(@user_limit)
+   	        if 1 != uh.update(:used => uh[:used].to_i + event_length)
+		    @database[:user_history].insert(:uuid => token , :create_date => Time.new.strftime("%F") ,:used => event_length, :search_times => 0 ,:search_time_consume => 0,:aggregate_times =>0,:aggregate_time_consume => 0)
+		end
+		event["host"] ||= client_address
+   		event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
+   		decorate(event)
+   		output_queue << event
+	    else
+		socket.puts "you reach your limit :"+ parse_limit(@user_limit).to_s
+		socket.close
+            end
+   	 end
+     end
+   end
   rescue EOFError
     @logger.debug? && @logger.debug("Connection closed", :client => socket.peer)
   rescue Errno::ECONNRESET
