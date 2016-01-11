@@ -151,11 +151,11 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
 
   def parse_limit(limit)
     if limit.end_with?("M") or limit.end_with("m") 
-        limit.gsub(/[mM]/,'').to_i*1024*1024
+        limit.gsub(/[mM]/,'').to_i<<20
 	elsif limit.end_with?("G") or limit.end_with("g") 
-        limit.gsub(/[gG]/,'').to_i*1024*1024*1024
+        limit.gsub(/[gG]/,'').to_i<<30
 	else
-		500*1024*1024
+		500<<20
     end
   end
 
@@ -163,15 +163,15 @@ class LogStash::Inputs::Tcp < LogStash::Inputs::Base
     while !stop?
       codec.decode(read(socket)) do |event|
    		 splits = event["message"].to_s.split(" ")
-   		 parameters = {}
-   		 parameters['uuid']=splits[0]
-   		 execute_statement("select used from user where uuid= :uuid",parameters) do |row|
-   		     num = row['used'] + event["message"].to_s.length
-   		     parameters={}
-   		     dataset = @database[:user].where(:uuid => splits[0])
-   		     if dataset.first[:used].to_i<parse_limit(@user_limit)
-   		         dataset.update(:used => num)
-   		         event["host"] ||= client_address
+   		 token = splits[0]
+   		 @database[:user].where(:uuid => token) do |row|
+			 uh = @database[:user_history].where(:uuid => token).where(:create_date => Time.new.strftime("%F"))
+   		     event_length = event["message"].to_s.length
+   		     if uh[:used].to_i<parse_limit(@user_limit)
+   		         if 1 != uh.update(:used => uh[:used].to_i + event_length)
+					@database[:user_history].insert(:uuid => token , :create_date => Time.new.strftime("%F") ,:used => event_length, :search_times => 0 ,:search_time_consume => 0,:aggregate_times =>0,:aggregate_time_consume => 0)
+				 end
+				 event["host"] ||= client_address
    		         event["sslsubject"] ||= socket.peer_cert.subject if @ssl_enable && @ssl_verify
    		         decorate(event)
    		         output_queue << event
